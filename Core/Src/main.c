@@ -39,6 +39,7 @@
 #define SYNC		0x55
 #define PID_DIAG	0x3C
 #define PID_NORM	0x10
+#define PID_SLSL 	0x20
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -63,6 +64,13 @@ volatile uint8_t lin_rx_state = 0;
 volatile uint8_t lin_rx_pid = 0;
 volatile uint8_t lin_rx_index = 0;
 
+// Estados MdE Slave
+#define STATE_WAITING		0
+#define STATE_PROCESS_PID	1
+#define STATE_NORMAL		2
+#define STATE_DIAGNOSTIC	3
+#define STATE_SLAVE_SLAVE	4
+
 // Variables para Diagnóstico (Punto 2)
 volatile uint8_t modo_diagnostico_activo = DIAG_OFF;
 volatile uint32_t tiempo_inicio_diagnostico = 0;
@@ -82,6 +90,8 @@ static void MX_USART6_UART_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 volatile uint32_t value_read_ADC;
+volatile uint8_t debug_placa = 0;
+
 
 void Test_Placa_Hardware(void);
 uint8_t Calcular_Checksum(uint8_t *data, uint8_t length);
@@ -132,78 +142,83 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-      // --- CHEQUEO DE BOTON PARA DIAGNOSTICO (PUNTO 2) ---
-      // Usamos el boton azul de la Nucleo (PC13)
-      if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13) == GPIO_PIN_RESET) {
-          modo_diagnostico_activo = DIAG_ON;
-          tiempo_inicio_diagnostico = HAL_GetTick();
-      }
+	  if(!debug_placa){
+		  // --- CHEQUEO DE BOTON PARA DIAGNOSTICO (PUNTO 2) ---
+		  // Usamos el boton azul de la Nucleo (PC13)
+		  if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13) == GPIO_PIN_RESET) {
+			  modo_diagnostico_activo = DIAG_ON;
+			  tiempo_inicio_diagnostico = HAL_GetTick();
+		  }
+
+		  // Control de tiempo de diagnóstico (10 segundos)
+		  if (modo_diagnostico_activo) {
+			  if ((HAL_GetTick() - tiempo_inicio_diagnostico) > DIAG_DURATION) {
+				  modo_diagnostico_activo = DIAG_OFF;
+			  }
+		  }
+
+		  /* --- LOGICA DEL MASTER (UART1) --- */
+		  uint8_t lin_header[2];
+		  uint8_t lin_data[4];
+		  uint8_t checksum;
+
+		  if (modo_diagnostico_activo) {
+			  // PUNTO 2: Trama Diagnóstico
+			  HAL_LIN_SendBreak(&huart1);
+			  lin_header[0] = SYNC;	// Sync 0b01010101
+			  lin_header[1] = PID_DIAG; // PID Diagnostico
+			  HAL_UART_Transmit(&huart1, lin_header, 2, 10);
+
+			  lin_data[0] = 0xFF; // Comando generico
+			  checksum = Calcular_Checksum(lin_data, 1);
+			  HAL_UART_Transmit(&huart1, lin_data, 1, 10);
+			  HAL_UART_Transmit(&huart1, &checksum, 1, 10);
+
+		  } else {
+			  // Leer sensores directos
+			  HAL_ADC_Start(&hadc1);
+			  HAL_ADC_PollForConversion(&hadc1, 10);
+			  uint16_t pot_val = HAL_ADC_GetValue(&hadc1);
+
+			  uint8_t sw_state = 0;
+			  if (HAL_GPIO_ReadPin(GPIOC, SW1_Pin) == GPIO_PIN_RESET) sw_state |= 0x01;
+			  if (HAL_GPIO_ReadPin(GPIOC, SW2_Pin) == GPIO_PIN_RESET) sw_state |= 0x02;
+			  if (HAL_GPIO_ReadPin(GPIOC, SW3_Pin) == GPIO_PIN_RESET) sw_state |= 0x04;
+
+			  // PUNTO 1: Trama Normal
+			  HAL_LIN_SendBreak(&huart1);
+			  lin_header[0] = SYNC;
+			  lin_header[1] = PID_NORM; // PID Normal
+			  HAL_UART_Transmit(&huart1, lin_header, 2, 10);
+
+			  lin_data[0] = sw_state;
+			  lin_data[1] = (uint8_t)(pot_val >> 4);
+			  checksum = Calcular_Checksum(lin_data, 2);
+			  HAL_UART_Transmit(&huart1, lin_data, 2, 10);
+			  HAL_UART_Transmit(&huart1, &checksum, 1, 10);
+
+			  HAL_Delay(10); // Pausa entre tramas del schedule table
+
+			  // PUNTO 3: Trama Multi-Slave
+
+			  HAL_LIN_SendBreak(&huart1);
+			  lin_header[0] = SYNC;
+			  lin_header[1] = PID_SLSL; // PID Slave-to-Slave
+			  HAL_UART_Transmit(&huart1, lin_header, 2, 10);
+
+			  lin_data[0] = (uint8_t)(pot_val >> 4);
+			  checksum = Calcular_Checksum(lin_data, 1);
+			  HAL_UART_Transmit(&huart1, lin_data, 1, 10);
+			  HAL_UART_Transmit(&huart1, &checksum, 1, 10);
+		  }
+
+		  HAL_Delay(100); // Ciclo de 100ms
+  	  }else{
+  		// Opcional: Para testear directo sin LIN, descomentar la siguiente linea:
+  		Test_Placa_Hardware();
+  	  }
+
       
-      // Control de tiempo de diagnóstico (10 segundos)
-      if (modo_diagnostico_activo) {
-          if ((HAL_GetTick() - tiempo_inicio_diagnostico) > DIAG_DURATION) {
-              modo_diagnostico_activo = DIAG_OFF;
-          }
-      }
-
-      /* --- LOGICA DEL MASTER (UART1) --- */
-      uint8_t lin_header[2];
-      uint8_t lin_data[4];
-      uint8_t checksum;
-
-      if (modo_diagnostico_activo) {
-          // PUNTO 2: Trama Diagnóstico
-          HAL_LIN_SendBreak(&huart1);
-          lin_header[0] = SYNC;	// Sync 0b01010101
-          lin_header[1] = PID_DIAG; // PID Diagnostico
-          HAL_UART_Transmit(&huart1, lin_header, 2, 10);
-          
-          lin_data[0] = 0xFF; // Comando generico
-          checksum = Calcular_Checksum(lin_data, 1);
-          HAL_UART_Transmit(&huart1, lin_data, 1, 10);
-          HAL_UART_Transmit(&huart1, &checksum, 1, 10);
-          
-      } else {
-          // Leer sensores directos
-          HAL_ADC_Start(&hadc1);
-          HAL_ADC_PollForConversion(&hadc1, 10);
-          uint16_t pot_val = HAL_ADC_GetValue(&hadc1);
-          
-          uint8_t sw_state = 0;
-          if (HAL_GPIO_ReadPin(GPIOC, SW1_Pin) == GPIO_PIN_RESET) sw_state |= 0x01;
-          if (HAL_GPIO_ReadPin(GPIOC, SW2_Pin) == GPIO_PIN_RESET) sw_state |= 0x02;
-          if (HAL_GPIO_ReadPin(GPIOC, SW3_Pin) == GPIO_PIN_RESET) sw_state |= 0x04;
-
-          // PUNTO 1: Trama Normal
-          HAL_LIN_SendBreak(&huart1);
-          lin_header[0] = SYNC;
-          lin_header[1] = PID_NORM; // PID Normal
-          HAL_UART_Transmit(&huart1, lin_header, 2, 10);
-          
-          lin_data[0] = sw_state;
-          lin_data[1] = (uint8_t)(pot_val >> 4);
-          checksum = Calcular_Checksum(lin_data, 2);
-          HAL_UART_Transmit(&huart1, lin_data, 2, 10);
-          HAL_UART_Transmit(&huart1, &checksum, 1, 10);
-          
-          HAL_Delay(10); // Pausa entre tramas del schedule table
-
-          // PUNTO 3: Trama Multi-Slave
-          HAL_LIN_SendBreak(&huart1);
-          lin_header[0] = 0x55;
-          lin_header[1] = 0x20; // PID Slave-to-Slave
-          HAL_UART_Transmit(&huart1, lin_header, 2, 10);
-          
-          lin_data[0] = (uint8_t)(pot_val >> 4); 
-          checksum = Calcular_Checksum(lin_data, 1);
-          HAL_UART_Transmit(&huart1, lin_data, 1, 10);
-          HAL_UART_Transmit(&huart1, &checksum, 1, 10);
-      }
-
-      HAL_Delay(100); // Ciclo de 100ms
-
-      // Opcional: Para testear directo sin LIN, descomentar la siguiente linea:
-      // Test_Placa_Hardware();
 
     /* USER CODE END WHILE */
 
@@ -479,53 +494,54 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
     if (huart->Instance == USART6) {
         // Máquina de estados del Esclavo
         switch(lin_rx_state) {
-            case 0: // Sync
-                if (lin_rx_byte == 0x55) lin_rx_state = 1;
+            case STATE_WAITING: // Sync
+                if (lin_rx_byte == 0x55) lin_rx_state = STATE_PROCESS_PID;
                 break;
-            case 1: // PID
+            case STATE_PROCESS_PID: // PID
                 lin_rx_pid = lin_rx_byte;
                 lin_rx_index = 0;
-                if (lin_rx_pid == 0x10) lin_rx_state = 2;
-                else if (lin_rx_pid == 0x3C) lin_rx_state = 3;
-                else if (lin_rx_pid == 0x20) lin_rx_state = 4;
-                else lin_rx_state = 0; 
+                if (lin_rx_pid == 0x10) lin_rx_state = STATE_NORMAL;
+                else if (lin_rx_pid == 0x3C) lin_rx_state = STATE_DIAGNOSTIC;
+                else if (lin_rx_pid == 0x20) lin_rx_state = STATE_SLAVE_SLAVE;
+                else lin_rx_state = STATE_WAITING;
                 break;
-            case 2: // Recibir P1
+            case STATE_NORMAL: // Recibir P1
                 lin_rx_buffer[lin_rx_index++] = lin_rx_byte;
                 if (lin_rx_index == 3) { // 2 data + 1 chk
                     if (lin_rx_buffer[2] == Calcular_Checksum((uint8_t*)lin_rx_buffer, 2)) {
                         Procesar_Trama_Esclavo();
                     }
-                    lin_rx_state = 0;
+                    lin_rx_state = STATE_WAITING;
                 }
                 break;
-            case 3: // Recibir P2 (Diagnóstico)
+            case STATE_DIAGNOSTIC: // Recibir P2 (Diagnóstico)
                 lin_rx_buffer[lin_rx_index++] = lin_rx_byte;
                 if (lin_rx_index == 2) { // 1 data + 1 chk
                     if (lin_rx_buffer[1] == Calcular_Checksum((uint8_t*)lin_rx_buffer, 1)) {
-                        HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5|GPIO_PIN_6|GPIO_PIN_7);
-                        HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_13|GPIO_PIN_14|GPIO_PIN_15);
+                        HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_6|GPIO_PIN_7);
+                        HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_6);
+                        HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_13|GPIO_PIN_14|GPIO_PIN_15);
                     }
-                    lin_rx_state = 0;
+                    lin_rx_state = STATE_WAITING;
                 }
                 break;
-            case 4: // Recibir P3 (Multi-Slave)
+            case STATE_SLAVE_SLAVE: // Recibir P3 (Multi-Slave)
                 lin_rx_buffer[lin_rx_index++] = lin_rx_byte;
                 if (lin_rx_index == 2) { // 1 data + 1 chk
                     if (lin_rx_buffer[1] == Calcular_Checksum((uint8_t*)lin_rx_buffer, 1)) {
                         uint8_t pot = lin_rx_buffer[0];
-                        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0,  (pot > 40)  ? GPIO_PIN_SET : GPIO_PIN_RESET);
-                        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1,  (pot > 80)  ? GPIO_PIN_SET : GPIO_PIN_RESET);
-                        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2,  (pot > 120) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-                        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, (pot > 160) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-                        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, (pot > 200) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-                        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, (pot > 240) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+                        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13,  (pot > 40)  ? GPIO_PIN_SET : GPIO_PIN_RESET);
+                        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14,  (pot > 80)  ? GPIO_PIN_SET : GPIO_PIN_RESET);
+                        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15,  (pot > 120) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+                        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, (pot > 160) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+                        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, (pot > 200) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+                        //HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, (pot > 240) ? GPIO_PIN_SET : GPIO_PIN_RESET);
                     }
-                    lin_rx_state = 0;
+                    lin_rx_state = STATE_WAITING;
                 }
                 break;
             default:
-                lin_rx_state = 0;
+                lin_rx_state = STATE_WAITING;
                 break;
         }
         
@@ -545,9 +561,9 @@ uint8_t Calcular_Checksum(uint8_t *data, uint8_t length) {
 
 void Procesar_Trama_Esclavo(void) {
     uint8_t sw_state = lin_rx_buffer[0];
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, (sw_state & 0x01) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, (sw_state & 0x02) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_7, (sw_state & 0x04) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, (sw_state & 0x01) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_7, (sw_state & 0x02) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, (sw_state & 0x04) ? GPIO_PIN_SET : GPIO_PIN_RESET);
 }
 
 void Test_Placa_Hardware(void) {
